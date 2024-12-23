@@ -1,0 +1,237 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.optimize import minimize
+import os
+
+# Caminho do arquivo (ajuste conforme o local do seu arquivo)
+data_path = os.path.join('dados', 'base_dados.xlsx')
+
+# Carregar os dados
+df = pd.read_excel(data_path, sheet_name='Resumo')
+
+# Converter a coluna 'Data' para o formato datetime
+df['Data'] = pd.to_datetime(df['Data'])
+
+# Definir 'Data' como índice
+df.set_index('Data', inplace=True)
+
+# Lista de ativos
+ativos = ['BRAX11', 'IVVB11', 'SMAL11', 'DIVO11', 'IMA-B 5', 'IMA-B 5+', 'IMA-S', 'IRF-M']
+
+# Garantir que temos CDI e IBOV para comparação
+referencias = ['CDI', 'IBOV']
+
+# Calcular retornos diários
+retornos = df[ativos + referencias].pct_change().dropna()
+
+# Função para calcular métricas da carteira
+def calcular_portfolio(pesos, retornos, rf):
+    retornos_portfolio = np.dot(retornos.mean(), pesos) * 252  # Retorno médio anualizado
+    volatilidade = np.sqrt(np.dot(pesos.T, np.dot(retornos.cov() * 252, pesos)))  # Volatilidade anualizada
+    sharpe_ratio = (retornos_portfolio - rf) / volatilidade
+    return retornos_portfolio, volatilidade, sharpe_ratio
+
+# Função objetivo para a otimização (maximizar Índice de Sharpe)
+def objetivo_sharpe(pesos, retornos, rf):
+    retorno, volatilidade, sharpe_ratio = calcular_portfolio(pesos, retornos, rf)
+    return -sharpe_ratio  # Negativo porque o otimizador minimiza
+
+# Restrição para a soma dos pesos ser igual a 1
+def restricao_soma_pesos(pesos):
+    return np.sum(pesos) - 1
+
+# Definir os limites para os pesos (entre 0 e 1 para cada ativo)
+limites = tuple((0, 1) for ativo in ativos)
+restricoes = {'type': 'eq', 'fun': restricao_soma_pesos}
+
+# Selecionar anos a partir de 2015
+anos = sorted(retornos.index.year.unique())
+anos = [ano for ano in anos if ano >= 2015]
+
+# Inicializar variáveis para armazenar resultados
+pesos_carteira = {}
+retornos_anuais_carteira = pd.Series(dtype=float)
+retornos_anuais_CDI = pd.Series(dtype=float)
+retornos_anuais_IBOV = pd.Series(dtype=float)
+
+valor_inicial = 1000
+valor_acumulado = valor_inicial
+retornos_acumulados = pd.DataFrame()
+
+# Variável para armazenar todos os retornos diários da carteira otimizada
+retornos_diarios_carteira = pd.Series(dtype=float)
+
+# Dicionário para armazenar os retornos anuais
+retorno_ano_a_ano = {'Ano': [], 'Carteira Otimizada (%)': [], 'CDI (%)': [], 'IBOV (%)': []}
+
+# Loop para cada ano
+for ano in anos:
+    # Dados de treinamento até o ano anterior
+    dados_treinamento = retornos[retornos.index.year < ano][ativos + ['CDI']]
+    # Dados de teste para o ano atual
+    dados_teste = retornos[retornos.index.year == ano]
+    if dados_treinamento.empty or dados_teste.empty:
+        print(f"Dados insuficientes para o ano {ano}. Pulando para o próximo ano.")
+        continue
+    # Taxa livre de risco média anualizada (CDI)
+    rf = dados_treinamento['CDI'].mean() * 252
+    dados_treinamento_ativos = dados_treinamento[ativos]
+    pesos_iniciais = np.array(len(ativos) * [1 / len(ativos)])
+    resultado = minimize(objetivo_sharpe, pesos_iniciais, args=(dados_treinamento_ativos, rf),
+                         method='SLSQP', bounds=limites, constraints=restricoes)
+
+    if not resultado.success:
+        print(f"Otimização falhou para o ano {ano}. Mensagem: {resultado.message}")
+        continue
+    pesos_otimizados = resultado.x
+    pesos_carteira[ano] = pesos_otimizados
+
+    # Calcular os retornos diários da carteira para este ano com base nos pesos otimizados
+    retornos_portfolio_diario = dados_teste[ativos].dot(pesos_otimizados)
+    retornos_diarios_carteira = pd.concat([retornos_diarios_carteira, retornos_portfolio_diario])
+
+    # Atualizar o valor acumulado da carteira
+    acumulado_atual = (1 + retornos_portfolio_diario).cumprod() * valor_acumulado
+    valor_acumulado = acumulado_atual.iloc[-1]
+    retornos_acumulados = pd.concat([retornos_acumulados, acumulado_atual.to_frame('Carteira Otimizada')], axis=0)
+
+    # Calcular a rentabilidade total anual da carteira e benchmarks usando CAGR
+    rentabilidade_total_anual_carteira = (1 + retornos_portfolio_diario).prod() - 1
+    rentabilidade_total_anual_CDI = (1 + dados_teste['CDI']).prod() - 1
+    rentabilidade_total_anual_IBOV = (1 + dados_teste['IBOV']).prod() - 1
+
+    # Calcular o número de anos com base nos dias úteis (252 dias úteis em um ano)
+    N_dias_uteis_ano = retornos_portfolio_diario.shape[0]
+    N_anos_ano_atual = N_dias_uteis_ano / 252
+
+    # Calcular o retorno médio anualizado (CAGR) para o ano atual
+    retorno_anual_carteira = (1 + rentabilidade_total_anual_carteira) ** (1 / N_anos_ano_atual) - 1
+    retorno_anual_CDI = (1 + rentabilidade_total_anual_CDI) ** (1 / N_anos_ano_atual) - 1
+    retorno_anual_IBOV = (1 + rentabilidade_total_anual_IBOV) ** (1 / N_anos_ano_atual) - 1
+
+    retornos_anuais_carteira[ano] = retorno_anual_carteira
+    retornos_anuais_CDI[ano] = retorno_anual_CDI
+    retornos_anuais_IBOV[ano] = retorno_anual_IBOV
+
+    # Adicionar os valores ao dicionário para a tabela ano a ano
+    retorno_ano_a_ano['Ano'].append(ano)
+    retorno_ano_a_ano['Carteira Otimizada (%)'].append(retorno_anual_carteira * 100)
+    retorno_ano_a_ano['CDI (%)'].append(retorno_anual_CDI * 100)
+    retorno_ano_a_ano['IBOV (%)'].append(retorno_anual_IBOV * 100)
+
+    print(f'\nComposição da carteira para {ano}:')
+    for ativo, peso in zip(ativos, pesos_otimizados):
+        print(f'{ativo}: {peso:.2%}')
+
+    retorno_esperado, volatilidade_anual, sharpe_ratio = calcular_portfolio(pesos_otimizados, dados_treinamento_ativos, rf)
+    print(f'Retorno Esperado Anualizado: {retorno_esperado:.2%}')
+    print(f'Volatilidade Anualizada: {volatilidade_anual:.2%}')
+    print(f'Índice de Sharpe: {sharpe_ratio:.2f}')
+
+# Calcular a rentabilidade total acumulada da carteira
+rentabilidade_total_carteira = (1 + retornos_diarios_carteira).prod() - 1
+
+# Calcular a rentabilidade total acumulada do CDI e IBOV
+rentabilidade_total_CDI = (1 + retornos.loc[retornos_acumulados.index, 'CDI']).prod() - 1
+rentabilidade_total_IBOV = (1 + retornos.loc[retornos_acumulados.index, 'IBOV']).prod() - 1
+
+# Calcular o número total de anos com base nos dias úteis
+N_dias_uteis_total = retornos_diarios_carteira.shape[0]
+N_anos = N_dias_uteis_total / 252
+
+# Calcular a rentabilidade média anualizada (CAGR)
+retorno_medio_anual_carteira = (1 + rentabilidade_total_carteira) ** (1 / N_anos) - 1
+retorno_medio_anual_CDI = (1 + rentabilidade_total_CDI) ** (1 / N_anos) - 1
+retorno_medio_anual_IBOV = (1 + rentabilidade_total_IBOV) ** (1 / N_anos) - 1
+
+# Volatilidade anualizada da carteira
+volatilidade_carteira = retornos_diarios_carteira.std() * np.sqrt(252)
+
+# Volatilidade anualizada do CDI e IBOV
+volatilidade_CDI = retornos['CDI'].std() * np.sqrt(252)
+volatilidade_IBOV = retornos['IBOV'].std() * np.sqrt(252)
+
+# Sharpe da carteira
+rf_historico = retorno_medio_anual_CDI  # Usamos o retorno médio anualizado do CDI como taxa livre de risco
+sharpe_carteira = (retorno_medio_anual_carteira - rf_historico) / volatilidade_carteira
+
+# Exibir as métricas
+print(f'\nRentabilidade total da Carteira Otimizada: {rentabilidade_total_carteira:.2%}')
+print(f'Volatilidade Anualizada da Carteira Otimizada: {volatilidade_carteira:.2%}')
+print(f'Índice de Sharpe da Carteira Otimizada: {sharpe_carteira:.2f}')
+print(f'Retorno Médio Anualizado da Carteira Otimizada (CAGR): {retorno_medio_anual_carteira:.2%}')
+
+print(f'\nRentabilidade total do CDI: {rentabilidade_total_CDI:.2%}')
+print(f'Volatilidade Anualizada do CDI: {volatilidade_CDI:.2%}')
+print(f'Retorno Médio Anualizado do CDI (CAGR): {retorno_medio_anual_CDI:.2%}')
+
+print(f'\nRentabilidade total do IBOV: {rentabilidade_total_IBOV:.2%}')
+print(f'Volatilidade Anualizada do IBOV: {volatilidade_IBOV:.2%}')
+print(f'Retorno Médio Anualizado do IBOV (CAGR): {retorno_medio_anual_IBOV:.2%}')
+
+# Exibir a tabela com o retorno ano a ano
+tabela_retornos = pd.DataFrame(retorno_ano_a_ano)
+print('\nTabela de Retornos Ano a Ano:')
+print(tabela_retornos)
+
+# Plotar retornos acumulados
+plt.figure(figsize=(12, 6))
+plt.plot(retornos_acumulados.index, retornos_acumulados, label='Carteira Otimizada')
+plt.plot(retornos_acumulados.index, (1 + retornos.loc[retornos_acumulados.index, 'CDI']).cumprod() * valor_inicial,
+         label='CDI', linestyle='--')
+plt.plot(retornos_acumulados.index, (1 + retornos.loc[retornos_acumulados.index, 'IBOV']).cumprod() * valor_inicial,
+         label='IBOV', linestyle='--')
+
+plt.legend()
+plt.title('Retornos Acumulados ao Longo do Tempo (Início em 1000)')
+plt.xlabel('Data')
+plt.ylabel('Retorno Acumulado (Base 1000)')
+plt.show()
+
+# Função para calcular a fronteira eficiente
+def calcular_fronteira_eficiente(retornos, rf, n_pontos=100):
+    volatilidades = []
+    retornos_fronteira = []
+    pesos_otimizados = []
+    for alfa in np.linspace(0, 1, n_pontos):
+        # Gerar pesos com combinação convexa (linha da fronteira)
+        pesos = np.array([alfa] + [(1 - alfa) / (len(ativos) - 1)] * (len(ativos) - 1))
+        retorno, volatilidade, _ = calcular_portfolio(pesos, retornos, rf)
+        volatilidades.append(volatilidade)
+        retornos_fronteira.append(retorno)
+        pesos_otimizados.append(pesos)
+    return volatilidades, retornos_fronteira, pesos_otimizados
+
+# Calcular a fronteira eficiente
+volatilidades_fronteira, retornos_fronteira, _ = calcular_fronteira_eficiente(retornos[ativos], rf_historico)
+
+# Gráfico da fronteira eficiente
+plt.figure(figsize=(14, 8))
+
+# Carteiras aleatórias
+plt.scatter(volatilidades_aleatorias, retornos_aleatorios, c=sharpes_aleatorios, cmap='viridis', s=50, alpha=0.6, label='Carteiras Aleatórias')
+
+# Linha da fronteira eficiente
+plt.plot(volatilidades_fronteira, retornos_fronteira, color='green', label='Fronteira Eficiente', linewidth=2)
+
+# Carteira Markowitz (gerada pelo algoritmo)
+plt.scatter(volatilidade_carteira, retorno_medio_anual_carteira, color='red', label='Markowitz', s=100, marker='o')
+
+# Carteira Black-Litterman
+plt.scatter(volatilidade_black_litterman, retorno_black_litterman, color='black', label='Black-Litterman', s=100, marker='X')
+
+# CDI
+plt.scatter(volatilidade_CDI, retorno_medio_anual_CDI, color='blue', label='CDI', s=100, marker='P')
+
+# IBOV
+plt.scatter(volatilidade_IBOV, retorno_medio_anual_IBOV, color='orange', label='IBOV', s=100, marker='D')
+
+# Configurações do gráfico
+plt.colorbar(label='Índice de Sharpe')
+plt.title('Fronteira Eficiente com Carteiras Aleatórias e Benchmarks')
+plt.xlabel('Volatilidade Anualizada')
+plt.ylabel('Retorno Anualizado (CAGR)')
+plt.legend()
+plt.grid(True)
+plt.show()
