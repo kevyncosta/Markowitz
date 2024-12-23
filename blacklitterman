@@ -1,0 +1,276 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.optimize import minimize
+import os
+
+data_path = os.path.join('dados', 'base_dados.xlsx')
+
+
+df = pd.read_excel(data_path, sheet_name='Resumo')
+
+# Converter a coluna 'Data' para o formato datetime
+df['Data'] = pd.to_datetime(df['Data'])
+
+# Definir 'Data' como índice
+df.set_index('Data', inplace=True)
+
+# Lista de ativos
+ativos = ['BRAX11', 'IVVB11', 'SMAL11', 'DIVO11', 'IMA-B 5', 'IMA-B 5+', 'IMA-S', 'IRF-M']
+
+# Garantir que temos CDI e IBOV para comparação
+referencias = ['CDI', 'IBOV']
+
+# Calcular retornos diários
+retornos = df[ativos + referencias].pct_change().dropna()
+
+# Definir a taxa livre de risco diária (supondo 13% ao ano)
+rf_anual = 0.13
+rf_diaria = (1 + rf_anual) ** (1 / 252) - 1
+
+# Selecionar anos a partir de 2015
+anos = sorted(retornos.index.year.unique())
+anos = [ano for ano in anos if ano >= 2015]
+
+# Inicializar variáveis para armazenar resultados
+pesos_carteira = {}
+retornos_anuais_carteira = pd.Series(dtype=float)
+retornos_anuais_CDI = pd.Series(dtype=float)
+retornos_anuais_IBOV = pd.Series(dtype=float)
+
+valor_inicial = 1000
+valor_acumulado = valor_inicial
+retornos_acumulados = pd.DataFrame()
+
+# Variável para armazenar todos os retornos diários da carteira otimizada
+retornos_diarios_carteira = pd.Series(dtype=float)
+
+# Dicionário para armazenar os retornos anuais
+retorno_ano_a_ano = {'Ano': [], 'Carteira Otimizada (%)': [], 'CDI (%)': [], 'IBOV (%)': [], 'Sharpe Ratio': []}
+
+# Parâmetro de incerteza do retorno de equilíbrio
+tau = 0.025
+
+# Função para calcular métricas da carteira
+def calcular_portfolio(pesos, retornos_esperados, cov_matrix, rf):
+    retornos_portfolio = np.dot(retornos_esperados, pesos)  # Retorno esperado da carteira
+    volatilidade = np.sqrt(np.dot(pesos.T, np.dot(cov_matrix, pesos)))  # Volatilidade da carteira
+    sharpe_ratio = (retornos_portfolio - rf) / volatilidade
+    return retornos_portfolio, volatilidade, sharpe_ratio
+
+# Função objetivo para a otimização (maximizar Índice de Sharpe)
+def objetivo_sharpe(pesos, retornos_esperados, cov_matrix, rf):
+    retorno, volatilidade, sharpe_ratio = calcular_portfolio(pesos, retornos_esperados, cov_matrix, rf)
+    return -sharpe_ratio  # Negativo porque o otimizador minimiza
+
+# Restrição para a soma dos pesos ser igual a 1
+def restricao_soma_pesos(pesos):
+    return np.sum(pesos) - 1
+
+# Função para calcular o retorno anualizado
+def calcular_retorno_anualizado(retornos_diarios):
+    # Calcula o retorno total acumulado
+    retorno_total = (1 + retornos_diarios).prod() - 1
+    # Calcula o número total de dias
+    n_dias = len(retornos_diarios)
+    # Converte o número de dias em anos (assumindo 252 dias úteis por ano)
+    n_anos = n_dias / 252
+    # Calcula o retorno anualizado (CAGR)
+    retorno_anualizado = (1 + retorno_total) ** (1 / n_anos) - 1
+    return retorno_anualizado
+
+# Função para calcular a volatilidade anual
+def calcular_volatilidade_anual(retornos_diarios):
+    volatilidade_diaria = retornos_diarios.std()
+    volatilidade_anual = volatilidade_diaria * np.sqrt(252)
+    return volatilidade_anual
+
+# Definir os limites para os pesos (entre 0 e 1 para cada ativo)
+limites = tuple((0, 1) for ativo in ativos)
+restricoes = {'type': 'eq', 'fun': restricao_soma_pesos}
+
+# Número de ativos
+n = len(ativos)
+
+# Dicionário para armazenar as visões do investidor para cada ano
+# Exemplo: visoes[ano] = {'P': matriz_P, 'Q': vetor_Q}
+visoes = {}
+
+# Definir as visões do investidor para cada ano
+for ano in anos:
+    # Exemplo de visões (personalize conforme necessário)
+    P = np.zeros((8, n))
+    P[0, ativos.index('BRAX11')] = 1  # Visão sobre BRAX11
+    P[1, ativos.index('IVVB11')] = 1  # Visão sobre IVVB11
+    P[2, ativos.index('SMAL11')] = 1  # Visão sobre SMAL11
+    P[3, ativos.index('DIVO11')] = 1  # Visão sobre DIVO11
+    P[4, ativos.index('IMA-B 5')] = 1  # Visão sobre IMA-B 5
+    P[5, ativos.index('IMA-B 5+')] = 1  # Visão sobre IMA-B 5+
+    P[6, ativos.index('IMA-S')] = 1  # Visão sobre IMA-S
+    P[7, ativos.index('IRF-M')] = 1  # Visão sobre IRF-M
+
+    # Definir Q com base no ano (exemplo)
+    if ano == 2015:
+        Q = np.array([-0.02, 0.02, -0.02, -0.02, 0, 0, 0.02, 0])
+    elif ano == 2016:
+        Q = np.array([-0.02, -0.02, -0.02, -0.02, 0, 0, 0.02, 0.02])
+    elif ano == 2017:
+        Q = np.array([-0.02, -0.02, -0.02, -0.02, 0.02, 0.02, 0.02, 0.02])
+    elif ano == 2018:
+        Q = np.array([0.02, 0.02, 0.02, 0.02, 0, 0, 0, 0])
+    elif ano == 2019:
+        Q = np.array([0.02, -0.02, 0.02, 0.02, 0, 0, 0, 0])
+    elif ano == 2020:
+        Q = np.array([0.02, -0.02, 0.02, 0.02, -0.02, -0.02, -0.02, -0.02])
+    elif ano == 2021:
+        Q = np.array([0.02, -0.02, 0.02, 0.02, 0, 0, 0, 0])
+    elif ano == 2022:
+        Q = np.array([-0.02, 0.02, -0.02, -0.02, 0.02, 0.02, 0.02, -0.02])
+    elif ano == 2023:
+        Q = np.array([-0.02, -0.02, -0.02, -0.02, 0.02, 0.02, 0.02, -0.02])
+    elif ano == 2024:
+        Q = np.array([0, -0.2, 0, 0, 0, 0, 0, 0])
+    else:
+        P = np.zeros((0, n))  # Sem visões adicionais
+        Q = np.array([])
+    visoes[ano] = {'P': P, 'Q': Q}
+
+# Loop para cada ano
+for ano in anos:
+    # Dados de treinamento até o ano anterior
+    dados_treinamento = retornos[retornos.index.year < ano][ativos + ['CDI', 'IBOV']]
+    # Dados de teste para o ano atual
+    dados_teste = retornos[retornos.index.year == ano]
+    if dados_treinamento.empty or dados_teste.empty:
+        print(f"Dados insuficientes para o ano {ano}. Pulando para o próximo ano.")
+        continue
+
+    # Calcular o beta dos ativos (em relação ao IBOV)
+    betas = []
+    for ativo in ativos:
+        cov_matrix_treinamento = np.cov(dados_treinamento[ativo], dados_treinamento['IBOV'])
+        beta = cov_matrix_treinamento[0, 1] / cov_matrix_treinamento[1, 1]
+        betas.append(beta)
+
+    # Calcular o retorno esperado dos ativos usando CAPM
+    retorno_mercado_treinamento = dados_treinamento['IBOV'].mean() * 252
+    pi = rf_anual + np.array(betas) * (retorno_mercado_treinamento - rf_anual)
+
+    # Matriz de covariância dos retornos dos ativos
+    cov_matrix_treinamento = dados_treinamento[ativos].cov() * 252
+
+    # Recuperar as visões do investidor para o ano atual
+    P = visoes[ano]['P']
+    Q = visoes[ano]['Q']
+
+    if P.size > 0 and Q.size > 0:
+        # Definir um nível de incerteza padrão
+        delta = 0.05
+        omega = np.diag(np.full(P.shape[0], delta))
+
+        # Calcular os retornos ajustados pelo modelo de Black-Litterman
+        M_inverse = np.linalg.inv(tau * cov_matrix_treinamento)
+        Omega_inverse = np.linalg.inv(omega)
+        retornos_ajustados = np.linalg.inv(M_inverse + np.dot(P.T, np.dot(Omega_inverse, P)))
+        retornos_ajustados = np.dot(retornos_ajustados, (np.dot(M_inverse, pi) + np.dot(P.T, np.dot(Omega_inverse, Q))))
+    else:
+        # Sem visões adicionais; usar pi como retornos esperados
+        retornos_ajustados = pi
+
+    # Otimização da carteira usando os retornos ajustados
+    pesos_iniciais = np.array(len(ativos) * [1 / len(ativos)])
+    resultado = minimize(objetivo_sharpe, pesos_iniciais, args=(retornos_ajustados, cov_matrix_treinamento, rf_anual),
+                         method='SLSQP', bounds=limites, constraints=restricoes)
+
+    if not resultado.success:
+        print(f"Otimização falhou para o ano {ano}. Mensagem: {resultado.message}")
+        continue
+
+    pesos_otimizados = resultado.x
+    pesos_carteira[ano] = pesos_otimizados
+
+    # Calcular os retornos diários da carteira para este ano com base nos pesos otimizados
+    retornos_portfolio_diario = dados_teste[ativos].dot(pesos_otimizados)
+    retornos_diarios_carteira = pd.concat([retornos_diarios_carteira, retornos_portfolio_diario])
+
+    # Atualizar o valor acumulado da carteira
+    acumulado_atual = (1 + retornos_portfolio_diario).cumprod() * valor_acumulado
+    valor_acumulado = acumulado_atual.iloc[-1]
+    retornos_acumulados = pd.concat([retornos_acumulados, acumulado_atual.to_frame('Carteira Otimizada')], axis=0)
+
+    # Calcular a rentabilidade total anual da carteira e benchmarks
+    rentabilidade_total_anual_carteira = (1 + retornos_portfolio_diario).prod() - 1
+    rentabilidade_total_anual_CDI = (1 + dados_teste['CDI']).prod() - 1
+    rentabilidade_total_anual_IBOV = (1 + dados_teste['IBOV']).prod() - 1
+
+    # Calcular o Índice de Sharpe anualizado
+    excesso_retorno = retornos_portfolio_diario - rf_diaria
+    sharpe_ratio_anual = (excesso_retorno.mean() * 252) / (excesso_retorno.std() * np.sqrt(252))
+
+    # Adicionar os valores ao dicionário para a tabela ano a ano
+    retorno_ano_a_ano['Ano'].append(ano)
+    retorno_ano_a_ano['Carteira Otimizada (%)'].append(rentabilidade_total_anual_carteira * 100)
+    retorno_ano_a_ano['CDI (%)'].append(rentabilidade_total_anual_CDI * 100)
+    retorno_ano_a_ano['IBOV (%)'].append(rentabilidade_total_anual_IBOV * 100)
+    retorno_ano_a_ano['Sharpe Ratio'].append(sharpe_ratio_anual)
+
+    print(f'\nComposição da carteira para {ano}:')
+    for ativo, peso in zip(ativos, pesos_otimizados):
+        print(f'{ativo}: {peso:.2%}')
+
+    print(f'Retorno Anual da Carteira Otimizada: {rentabilidade_total_anual_carteira * 100:.2f}%')
+    print(f'Índice de Sharpe Anualizado: {sharpe_ratio_anual:.2f}')
+
+# Converter o dicionário em DataFrame
+df_retorno_ano_a_ano = pd.DataFrame(retorno_ano_a_ano)
+
+# Exibir a tabela de rentabilidade ano a ano
+print("\nRentabilidade Ano a Ano:")
+print(df_retorno_ano_a_ano)
+
+# Calcular a rentabilidade acumulada
+retorno_acumulado_carteira = (1 + retornos_diarios_carteira).cumprod()
+retorno_acumulado_CDI = (1 + retornos['CDI'][retornos_diarios_carteira.index]).cumprod()
+retorno_acumulado_IBOV = (1 + retornos['IBOV'][retornos_diarios_carteira.index]).cumprod()
+
+# Calcular o retorno total acumulado em porcentagem
+retorno_total_carteira = (retorno_acumulado_carteira.iloc[-1] - 1) * 100
+retorno_total_CDI = (retorno_acumulado_CDI.iloc[-1] - 1) * 100
+retorno_total_IBOV = (retorno_acumulado_IBOV.iloc[-1] - 1) * 100
+
+# Exibir os retornos totais
+print("\nRetorno Total Acumulado no Período:")
+print(f"Carteira Otimizada: {retorno_total_carteira:.2f}%")
+print(f"CDI: {retorno_total_CDI:.2f}%")
+print(f"IBOV: {retorno_total_IBOV:.2f}%")
+
+# Calcular e imprimir o retorno anualizado da carteira
+retorno_anualizado_carteira = calcular_retorno_anualizado(retornos_diarios_carteira)
+print(f'\nRetorno Anualizado da Carteira Otimizada: {retorno_anualizado_carteira * 100:.2f}%')
+
+# Calcular e imprimir a volatilidade anual da carteira
+volatilidade_anual_carteira = calcular_volatilidade_anual(retornos_diarios_carteira)
+print(f'Volatilidade Anual da Carteira Otimizada: {volatilidade_anual_carteira * 100:.2f}%')
+
+# Calcular e imprimir a volatilidade anual do CDI e do IBOV
+volatilidade_anual_CDI = calcular_volatilidade_anual(retornos['CDI'][retornos_diarios_carteira.index])
+volatilidade_anual_IBOV = calcular_volatilidade_anual(retornos['IBOV'][retornos_diarios_carteira.index])
+print(f'Volatilidade Anual do CDI: {volatilidade_anual_CDI * 100:.2f}%')
+print(f'Volatilidade Anual do IBOV: {volatilidade_anual_IBOV * 100:.2f}%')
+print(pi)
+# Plotar retornos acumulados
+plt.figure(figsize=(12, 6))
+plt.plot(retorno_acumulado_carteira.index, retorno_acumulado_carteira * valor_inicial, label='Carteira Otimizada')
+plt.plot(retorno_acumulado_CDI.index, retorno_acumulado_CDI * valor_inicial, label='CDI', linestyle='--')
+plt.plot(retorno_acumulado_IBOV.index, retorno_acumulado_IBOV * valor_inicial, label='IBOV', linestyle='--')
+
+plt.legend()
+plt.title('Retornos Acumulados ao Longo do Tempo (Início em 1000)')
+plt.xlabel('Data')
+plt.ylabel('Retorno Acumulado (Base 1000)')
+plt.show()
+
+# Calcular o Índice de Sharpe total do período
+excesso_retorno_total = retornos_diarios_carteira - rf_diaria
+sharpe_ratio_total = (excesso_retorno_total.mean() * 252) / (excesso_retorno_total.std() * np.sqrt(252))
+print(f'\nÍndice de Sharpe Total do Período: {sharpe_ratio_total:.2f}')
